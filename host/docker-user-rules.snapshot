@@ -1,0 +1,6 @@
+-N DOCKER-USER
+-A DOCKER-USER -d 100.64.0.0/10 -i br-sandbox -j DROP
+-A DOCKER-USER -d 169.254.0.0/16 -i br-sandbox -j DROP
+-A DOCKER-USER -d 192.168.0.0/16 -i br-sandbox -j DROP
+-A DOCKER-USER -d 172.16.0.0/12 -i br-sandbox -j DROP
+-A DOCKER-USER -d 10.0.0.0/8 -i br-sandbox -j DROP
