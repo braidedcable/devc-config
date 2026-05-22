@@ -72,7 +72,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Install Dolt via the official install script.
-RUN curl -fsSL https://www.dolthub.com/install.sh | sudo bash
+RUN curl -fsSL https://github.com/dolthub/dolt/releases/latest/download/install.sh | sudo bash
 
 # Create directories and set ownership (combined for fewer layers)
 RUN mkdir -p /commandhistory /workspace /home/vscode/.claude /opt && \
@@ -130,9 +130,10 @@ COPY --chown=vscode:vscode .zshrc /home/vscode/.zshrc.custom
 RUN echo 'source ~/.zshrc.custom' >> /home/vscode/.zshrc
 
 # ---- Gas Town additions: beads + gt CLIs ----
-# Both via the official install scripts. Latest at build time.
+# Beads: official install script. gt: `go install` from canonical path
+# (gastownhall/gastown). Latest at build time for both.
 RUN curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
-RUN curl -fsSL https://raw.githubusercontent.com/gastownhall/gastown/main/scripts/install.sh | bash
+RUN go install github.com/gastownhall/gastown/cmd/gt@latest
 
 # Copy post_install script
 COPY --chown=vscode:vscode post_install.py /opt/post_install.py
