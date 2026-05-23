@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+#
+# devc-up — bring up a devcontainer using one of our variants, with any
+# host-side setup that variant requires.
+#
+# Usage:
+#   devc-up <variant> [project_path]
+#
+#   variant:       default | beads | gastown
+#   project_path:  path to a git repo; defaults to current directory
+#
+# What it does:
+#   1. Validates the variant exists at ~/.claude-devcontainer-<variant>/.
+#   2. Validates the project path is a git repo.
+#   3. Flips ~/.claude-devcontainer to point at the requested variant.
+#   4. For beads/gastown variants, on the host:
+#        - bd init --quiet      (if .beads/ doesn't exist)
+#        - bd hooks install     (if hooks aren't installed)
+#        - git config core.hooksPath .beads/hooks
+#        - git config beads.role maintainer  (if not set)
+#   5. Populates the project's .devcontainer/ directory:
+#        - Copies the four files devc would copy (Dockerfile, devcontainer.json,
+#          post_install.py, .zshrc).
+#        - Copies any variant-specific init script (beads-init.sh,
+#          gastown-init.sh) since devc's hardcoded list doesn't include them.
+#   6. Runs `devc up` to build/start the container.
+#
+# Prerequisites:
+#   - devc on PATH
+#   - bd on PATH (only for beads/gastown variants)
+#   - Each variant directory must exist (~/.claude-devcontainer-<variant>/)
+#
+# Source-controlled at github.com/braidedcable/devc-config.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+log_info()    { printf '\033[36m[devc-up]\033[0m %s\n' "$*"; }
+log_warn()    { printf '\033[33m[devc-up]\033[0m %s\n' "$*" >&2; }
+log_error()   { printf '\033[31m[devc-up]\033[0m %s\n' "$*" >&2; }
+log_success() { printf '\033[32m[devc-up]\033[0m %s\n' "$*"; }
+
+die() {
+  log_error "$*"
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: devc-up <variant> [project_path]
+
+  variant       default | beads | gastown
+  project_path  path to a git repo; defaults to current directory
+
+Examples:
+  devc-up beads                       # current directory, beads variant
+  devc-up gastown ~/projects/foo      # specific project, gastown variant
+  devc-up default                     # plain sandboxed Claude Code
+
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  usage
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+VARIANT="$1"
+PROJECT_PATH="${2:-$PWD}"
+
+case "$VARIANT" in
+  default|beads|gastown) ;;
+  *) die "Unknown variant: $VARIANT. Expected one of: default, beads, gastown" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+# devc itself must be present.
+command -v devc >/dev/null 2>&1 || die "devc not found on PATH"
+
+# Resolve and validate the project path.
+if [[ ! -d "$PROJECT_PATH" ]]; then
+  die "Project path does not exist: $PROJECT_PATH"
+fi
+PROJECT_PATH="$(cd "$PROJECT_PATH" && pwd)"
+
+if [[ ! -d "$PROJECT_PATH/.git" ]]; then
+  die "Project is not a git repo (no .git/ in $PROJECT_PATH). Run 'git init' first."
+fi
+
+# The variant's source directory must exist.
+VARIANT_DIR="$HOME/.claude-devcontainer-$VARIANT"
+if [[ ! -d "$VARIANT_DIR" ]]; then
+  die "Variant directory not found: $VARIANT_DIR
+Set it up first by cloning trailofbits/claude-code-devcontainer and overlaying
+the variant files from ~/devc-config/$VARIANT/."
+fi
+
+# For beads/gastown, bd must be on the host PATH.
+if [[ "$VARIANT" != "default" ]]; then
+  if ! command -v bd >/dev/null 2>&1; then
+    die "bd not found on host PATH. Install with:
+  curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Flip the symlink
+# ---------------------------------------------------------------------------
+
+SYMLINK="$HOME/.claude-devcontainer"
+CURRENT_TARGET=""
+if [[ -L "$SYMLINK" ]]; then
+  CURRENT_TARGET="$(readlink "$SYMLINK")"
+fi
+
+if [[ "$CURRENT_TARGET" != "$VARIANT_DIR" ]]; then
+  log_info "Pointing $SYMLINK -> $VARIANT_DIR"
+  ln -sfn "$VARIANT_DIR" "$SYMLINK"
+else
+  log_info "Symlink already points at $VARIANT_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Host-side beads setup (beads + gastown variants)
+# ---------------------------------------------------------------------------
+
+if [[ "$VARIANT" == "beads" || "$VARIANT" == "gastown" ]]; then
+  log_info "Running host-side beads setup in $PROJECT_PATH"
+  cd "$PROJECT_PATH"
+
+  if [[ ! -d "$PROJECT_PATH/.beads" ]]; then
+    log_info "  bd init --quiet"
+    bd init --quiet
+  else
+    log_info "  bd init: .beads/ already exists, skipping"
+  fi
+
+  # bd hooks install is the operation that needs writable .git/config and
+  # writable .beads/hooks/. Both are fine on the host. Detect "already
+  # installed" via the existence of pre-commit in .beads/hooks/.
+  if [[ ! -f "$PROJECT_PATH/.beads/hooks/pre-commit" ]]; then
+    log_info "  bd hooks install"
+    bd hooks install
+  else
+    log_info "  bd hooks install: hooks already present, skipping"
+  fi
+
+  # Convert the absolute hooksPath that bd set to a repo-relative one,
+  # so the same path resolves correctly both on the host and inside the
+  # sandboxed container (where the workspace is at /workspace).
+  CURRENT_HOOKS_PATH="$(git config --get core.hooksPath 2>/dev/null || true)"
+  if [[ "$CURRENT_HOOKS_PATH" != ".beads/hooks" ]]; then
+    log_info "  git config core.hooksPath .beads/hooks"
+    git config core.hooksPath .beads/hooks
+  else
+    log_info "  core.hooksPath already relative, skipping"
+  fi
+
+  # beads.role: solo user => maintainer. Skip if already set.
+  if ! git config --get beads.role >/dev/null 2>&1; then
+    log_info "  git config beads.role maintainer"
+    git config beads.role maintainer
+  else
+    log_info "  beads.role already set, skipping"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Populate .devcontainer/
+#
+# devc has a hardcoded list of files it copies (Dockerfile, devcontainer.json,
+# post_install.py, .zshrc). It misses variant-specific scripts. We do the
+# whole copy ourselves to keep behavior predictable and to include our extras.
+# ---------------------------------------------------------------------------
+
+DC_DIR="$PROJECT_PATH/.devcontainer"
+mkdir -p "$DC_DIR"
+
+log_info "Populating $DC_DIR from $VARIANT_DIR"
+
+# The four files devc would copy. Required.
+for f in Dockerfile devcontainer.json post_install.py .zshrc; do
+  if [[ ! -f "$VARIANT_DIR/$f" ]]; then
+    die "Variant $VARIANT is missing required file: $f"
+  fi
+  cp "$VARIANT_DIR/$f" "$DC_DIR/"
+done
+
+# Variant-specific init scripts. Optional.
+for f in beads-init.sh gastown-init.sh; do
+  if [[ -f "$VARIANT_DIR/$f" ]]; then
+    cp "$VARIANT_DIR/$f" "$DC_DIR/"
+    chmod +x "$DC_DIR/$f"
+    log_info "  copied $f"
+  fi
+done
+
+# Drift detection: warn if the variant directory contains files we don't
+# know about. Doesn't fail; just calls attention. Excludes upstream-cruft
+# (LICENSE, README.md, .git, .github, install.sh, etc.) and our known
+# extras.
+KNOWN_FILES=(
+  Dockerfile devcontainer.json post_install.py .zshrc
+  beads-init.sh gastown-init.sh
+  LICENSE README.md install.sh post_install.py .dockerignore .gitignore
+  renovate.json .git .github .claude
+)
+shopt -s nullglob dotglob
+UNKNOWN=()
+for f in "$VARIANT_DIR"/*; do
+  base="$(basename "$f")"
+  for known in "${KNOWN_FILES[@]}"; do
+    if [[ "$base" == "$known" ]]; then
+      continue 2
+    fi
+  done
+  UNKNOWN+=("$base")
+done
+shopt -u nullglob dotglob
+
+if [[ ${#UNKNOWN[@]} -gt 0 ]]; then
+  log_warn "Unknown files in $VARIANT_DIR (not copied to .devcontainer/):"
+  for f in "${UNKNOWN[@]}"; do
+    log_warn "  - $f"
+  done
+  log_warn "If any of these need to be in the build context, update devc-up."
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Build and start
+# ---------------------------------------------------------------------------
+
+log_info "Running 'devc up' in $PROJECT_PATH"
+cd "$PROJECT_PATH"
+devc up
+
+log_success "Container is up. Drop in with: devc shell"
