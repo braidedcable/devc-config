@@ -75,6 +75,27 @@ bd CLI available; per the auto-generated CLAUDE.md section, it'll use
 `bd ready`, `bd update --claim`, `bd close`, etc. as part of its
 workflow.
 
+## Security posture
+
+Beyond the upstream Trail of Bits sandbox (network isolation, RO mounts
+on `.git/config` and `.git/hooks`), this variant adds one extra RO bind
+mount: `.beads/hooks/`. Without that, a compromised agent inside the
+container could rewrite the beads git hook scripts, and the malicious
+versions would execute as **your user on the host** the next time you
+ran `git commit` in the project on the host. The RO mount closes that
+escalation path.
+
+The cost: `bd hooks install` cannot run from inside the container.
+That's intentional. The `devc-up` wrapper runs `bd hooks install` on
+the host before container start, where it has full write access. Beads
+upgrades are also a host-side operation, so the upgrade-then-reinstall-
+hooks flow stays on the host.
+
+If you ever need to run `bd hooks install` against a project that's
+already inside a running container, stop the container, do it on the
+host, then start the container again. There's no use case for doing
+it from inside.
+
 ## What this variant deliberately doesn't do
 
 - **No Dolt remote.** Backlog stays local to the workspace's bind mount.
